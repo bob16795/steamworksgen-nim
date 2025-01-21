@@ -2,7 +2,7 @@
 
 ## Usage
 
-Use the `generateSteamworksAPI(jsonPath: string)` proc to read in an export the api calls from steams sdk see [the steamworks nimble package](https://github.com/treeform/steamworks) for a general API overview.
+Use the `generateSteamworksAPI(jsonPath: string)` proc to read in an export the api calls from steams sdk see [the steamworks nimble package](https://github.com/treeform/steamworks) for a more general API setup overview.
 
 ## Differences from the flat API
 
