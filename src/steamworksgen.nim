@@ -21,21 +21,12 @@ var steamworksInit*: bool
 
 # interfaces
 template generateInterface[T](call: untyped, name: string) =
-  var
-    isSet {.gensym.}: bool = false
-    iface {.gensym.}: T
-
   proc steamImpl(): T {.gensym, stdcall, dynlib: STEAM_API, importc: name.}
 
   template call*: T =
     if not steamworksInit:
-      echo "steam init before interface " & name
-      raise newException(OSError, "steam init before interface " & name)
-
-    if not isSet:
-      iface = steamImpl()
-      isSet = true
-    iface
+      initSteamworks()
+    steamImpl()
 
 # callback system
 type
@@ -50,9 +41,9 @@ type
 
 var callbacks* = initDoublyLinkedList[APICallback]()
 
-template registerCallback*[T: typedesc](
+template registerCallback*[T](
   id: static uint32,
-  callback: untyped, #??? proc(failed: bool, data: ptr T) {.stdcall.},
+  callback: proc(failed: bool, data: ptr T) {.stdcall.},
 ) =
   callbacks &= APICallback(
     p: cast[APIProc](callback),
@@ -71,26 +62,13 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
     gameIdNode = ident("GameId")
 
   result.add quote do:
+    # predefine for order
+    proc initSteamworks()
+
     # for nonflat -> flat
     type
       `steamIdNode`* = distinct uint64
       `gameIdNode`* = distinct uint64
-
-    proc initFlat(p: pointer): int32 {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_InitFlat".}
-
-    export steamworksInit
-    export lists
-
-    proc initSteamworks*() =
-      if steamworksInit:
-        raise newException(OSError, "steamworks double init")
-
-      var msg: array[1024, char]
-      if initFlat(nil) != 0:
-        #let res = $cast[cstring](addr msg[0])
-        raise newException(OSError, "steamworks init fail")
-
-      steamworksInit = true
 
   var
     types = [
@@ -130,6 +108,8 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
 
   for t in types.keys():
     echo "typedef: ", t
+
+  var steamworksInitString = ""
 
   proc getTypeFromTable(inName: string): NimNode =
     let name = inName
@@ -184,7 +164,6 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
 
     let identTo = getTypeFromTable(rawTo)
     if identTo == nil:
-      echo $rawName
       continue
 
     let
@@ -306,7 +285,7 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
         typeName = f["fieldtype"].getStr()
         typeIdent = getTypeFromTable(typeName)
 
-      echo "  field: " & cleanedName
+      echo "  field: " & cleanedName & ", " & typeName
 
       records.add(
         newIdentDefs(
@@ -376,14 +355,14 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
         typeName = f["fieldtype"].getStr()
         typeIdent = getTypeFromTable(typeName)
 
+      echo "  field: " & cleanedName & ", " & typeName
+
       records.add(
         newIdentDefs(
           name = postfix(ident(cleanedName), "*"),
           kind = typeIdent,
         )
       )
-
-      echo "  field: " & cleanedName
 
     let typeBody = newNimNode(nnkObjectTy)
           .add(newEmptyNode())
@@ -407,7 +386,6 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
           finish: true,
         )
 
-
   for i in jsonNode["interfaces"]:
     let
       name = i["classname"].getStr()
@@ -417,8 +395,12 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
 
     echo "interface: " & name
 
+    if "version_string" in i:
+      steamworksInitString &= i["version_string"].getStr()
+      steamworksInitString &= "\x00"
+
     result.add quote do:
-      type `nameNode`* = object
+      type `nameNode`* = distinct pointer
 
     if "accessors" in i:
       for a in i["accessors"][0..0]:
@@ -444,7 +426,7 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
 
           procName = ident(methodName[0..0].toLowerAscii() & methodName[1..^1])
 
-        echo "  method: " & $procName
+        echo "  method: " & $procName & ", " & $methodNameFlat
         var procNode = quote do:
           proc `procName`*(self: `nameNode`) {.stdcall, dynlib: `STEAM_API`, importc: `methodNameFlat`}
 
@@ -477,66 +459,88 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
             typeName = m["returntype"].getStr()
           if typeName != "void":
             procNode.params[0] = getTypeFromTable(typeName)
+            echo "    return: " & typeName
 
         result.add procNode
+
+  steamworksInitString &= "\x00"
+
+  let initString = newStrLitNode(steamworksInitString)
 
   result.add quote do:
     type
       CallbackMsg {.pure, bycopy.} = object
         user: HSteamUser
         callback: uint32
-        param: ptr uint8
+        param: pointer
         paramSize: uint32
 
-      SteamCallCompleted {.pure, bycopy.} = object
-        call: uint64
-        callback: uint32
-        paramSize: uint32
+    # init stuff
+    proc initInternal(versions: cstring, msg: pointer): int32 {.stdcall, dynlib: STEAM_API, importc: "SteamInternal_SteamAPI_Init".}
+
+    export lists
+
+    proc initSteamworks() =
+      var msg: array[1024, char]
+      if initInternal(`initString`.cstring, addr msg[0]) != 0:
+        let res = $cast[cstring](addr msg[0])
+        raise newException(OSError, "steamworks init fail" & $res)
+
+      steamworksInit = true
+
+    type
+      PSteamPipe = ptr HSteamPipe
 
     # some utils not in json
-    proc restartAppIfNecessary*(ownAppID: AppId): bool {.importc: "SteamAPI_RestartAppIfNecessary".}
+    proc restartAppIfNecessary*(ownAppID: AppId): bool {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_RestartAppIfNecessary".}
     export registerCallback
 
     # for manual callbacks
-    proc initManualDispatch*() {.importc: "SteamAPI_ManualDispatch_Init".}
-    proc runManualDispatchFrame(pipe: HSteamPipe) {.importc: "SteamAPI_ManualDispatch_RunFrame"}
+    proc initManualDispatch*() {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_ManualDispatch_Init".}
+    proc runManualDispatchFrame(pipe: PSteamPipe) {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_ManualDispatch_RunFrame"}
     proc nextManualDispatchCallback(
-      pipe: HSteamPipe, callback: ptr CallbackMsg,
-    ): bool {.importc: "SteamAPI_ManualDispatch_GetNextCallback".}
-    proc freeLastManualDispatchCallback(pipe: HSteamPipe) {.importc: "SteamAPI_ManualDispatch_FreeLastCallback".}
+      pipe: PSteamPipe, callback: ptr CallbackMsg,
+    ): bool {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_ManualDispatch_GetNextCallback".}
+    proc freeLastManualDispatchCallback(pipe: PSteamPipe) {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_ManualDispatch_FreeLastCallback".}
     proc getCallbackResult(
-      pipe: HSteamPipe, call: SteamAPICall, callback: pointer,
-      size: uint32, expected: uint32, failed: ptr bool,
-    ): bool {.importc: "SteamAPI_ManualDispatch_GetAPICallResult".}
+      pipe: PSteamPipe, call: SteamAPICall, callback: pointer,
+      size: uint32, expected: int32, failed: ptr bool,
+    ): bool {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_ManualDispatch_GetAPICallResult".}
 
-    `generateInterface`[HSteamPipe](steamPipe, "SteamAPI_GetHSteamPipe")
+    `generateInterface`[PSteamPipe](steamPipe, "SteamAPI_GetHSteamPipe")
+
+    var manualInit: bool
 
     proc runFrame*(steamUtils: ISteamUtils) =
+      if not steamworksInit:
+        initSteamworks()
+
+      if not manualInit:
+        initManualDispatch()
+        manualInit = true
+
       steamPipe().runManualDispatchFrame()
 
       var cbm: CallbackMsg
       while steamPipe().nextManualDispatchCallback(addr cbm):
         if cbm.callback == 703:
-          let completed = cast[ptr SteamCallCompleted](cbm.param)[]
-          let data = allocShared(completed.paramSize)
+          let completed = cast[ptr SteamAPICallCompleted](cbm.param)[]
+          let data = allocShared(completed.cubParam)
           let failed = true
 
           if steamPipe().getCallbackResult(
-            completed.call.SteamAPICall, data, completed.paramSize,
-            completed.callback, addr failed,
+            completed.asyncCall, data, completed.cubParam,
+            completed.iCallback, addr failed,
           ):
             var cn = callbacks.head
             while cn != nil:
               let c = cn.value
 
-              if c.callId.uint64 == completed.call.uint64:
+              if c.callId.uint64 == completed.asyncCall.uint64:
                 c.p(failed, data)
 
                 if c.finish:
-                  if cn.next != nil:
-                    cn.next.prev = cn.prev
-                  if cn.prev != nil:
-                    cn.prev.next = cn.next
+                  callbacks.remove(cn)
               cn = cn.next
           deallocShared(data)
         else:
@@ -550,10 +554,7 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
               c.p(fail, data)
 
               if c.finish:
-                if cn.next != nil:
-                  cn.next.prev = cn.prev
-                if cn.prev != nil:
-                  cn.prev.next = cn.next
+                callbacks.remove(cn)
             cn = cn.next
 
         steamPipe().freeLastManualDispatchCallback()
