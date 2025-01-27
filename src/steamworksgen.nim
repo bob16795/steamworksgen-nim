@@ -53,6 +53,18 @@ template registerCallback*[T](
     finish: false,
   )
 
+template registerCallbackOnce*[T](
+  id: static uint32,
+  callback: proc(failed: bool, data: ptr T) {.stdcall.},
+) =
+  callbacks &= APICallback(
+    p: cast[APIProc](callback),
+    callbackId: id,
+    callId: 0,
+    dataSize: sizeof(T),
+    finish: true,
+  )
+
 # actually generate the api
 proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
   result = newStmtList()
@@ -102,7 +114,7 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
       (
         "SteamAPIWarningMessageHook_t",
         quote do:
-          pointer,
+          proc(i: int, msg: cstring) {.cdecl.}
       ),
     ].toTable()
 
@@ -183,26 +195,33 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
 
   for e in jsonNode["enums"]:
     var fieldNames: seq[string]
-    var fieldValues: seq[NimNode]
+    var fieldValues: seq[int]
     for value in e["values"]:
       let
-        name = value["name"]
-          .getStr()
+        steamName = value["name"].getStr().toLowerAscii()
+        name = steamName
           .replace("k_", "")
-          .replace("K_", "")
           .strip(chars = {'_'})
-        val = newLit(value["value"].getStr())
+        val = value["value"].getStr().parseInt()
+
+      if "first" in name or
+         val in fieldValues:
+        echo "enum value: " & steamName & " ignored"
+        continue
 
       fieldNames &= name
       fieldValues &= val
 
-    var matchLen = fieldNames[0].high
+    # min enum entry len is 2
+    var matchLen = fieldNames[0].high - 2
 
     for f in 1..<fieldNames.len:
-      matchLen = min(fieldNames[f].high, matchLen)
-      while matchLen > 0 and
-            fieldNames[0][0..matchLen] != fieldNames[f][0..matchLen]:
-        matchLen -= 1
+      matchLen = min(matchLen, fieldNames[f].high - 2)
+      block check:
+        for c in 0..<matchLen:
+          if fieldNames[f][c] != fieldNames[0][c]:
+            matchLen = c
+            break check
 
     let
       name = ident(
@@ -218,24 +237,15 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
     for f in 0..<fieldNames.len:
       let
         nimName = nimIdentNormalize(
-          fieldNames[f][matchLen + 1].toLowerAscii() &
-          fieldNames[f][matchLen + 2..^1]
+          fieldNames[f][matchLen].toLowerAscii() &
+          fieldNames[f][matchLen + 1..^1]
         )
-        steamName = nimIdentNormalize(
-          fieldNames[f][0].toLowerAscii() &
-          fieldNames[f][1..^1]
-        )
+
       fields.add(newNimNode(nnkEnumFieldDef)
-        .add(ident(steamName))
-        .add(fieldValues[f])
+        .add(ident(nimName))
+        .add(newLit(fieldValues[f]))
       )
-      echo "  value: " & steamName & " = " & $fieldValues[f]
-      if steamName != nimName and nimName.len > 3:
-        fields.add(newNimNode(nnkEnumFieldDef)
-          .add(ident(nimName))
-          .add(fieldValues[f])
-        )
-        echo "  value: " & nimName & " = " & $fieldValues[f]
+      echo "  value: " & nimName & " = " & $fieldValues[f]
 
     result.add newEnum(
       name = name,
@@ -494,6 +504,7 @@ proc generateSteamAPIImpl*(jsonNode: JsonNode): NimNode =
     # some utils not in json
     proc restartAppIfNecessary*(ownAppID: AppId): bool {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_RestartAppIfNecessary".}
     export registerCallback
+    export registerCallbackOnce
 
     # for manual callbacks
     proc initManualDispatch*() {.stdcall, dynlib: STEAM_API, importc: "SteamAPI_ManualDispatch_Init".}
@@ -564,4 +575,5 @@ macro generateSteamAPI*(json: static string): untyped =
     jsonRaw = staticRead(json)
     jsonNode = parseJson(jsonRaw)
 
-  generateSteamAPIImpl(jsonNode)
+  result = generateSteamAPIImpl(jsonNode)
+  echo result.toStrLit
